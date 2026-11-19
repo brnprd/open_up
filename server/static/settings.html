@@ -1,0 +1,241 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OPEN_UP Settings</title>
+<link rel="stylesheet" href="/theme.css">
+<style>
+  body { padding: 16px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  h1 { font-size: 40px; margin: 0; font-weight: normal; letter-spacing: 2px; }
+  .bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  main { display: grid; grid-template-columns: 260px 1fr; gap: 20px; }
+  @media (max-width: 720px) { main { grid-template-columns: 1fr; } }
+  .box { padding: 16px 12px 10px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  #exts li { padding: 0 6px; cursor: pointer; display: flex; justify-content: space-between; }
+  #exts li.sel { background: var(--fg); color: var(--bg); }
+  #exts li.sel .dim { color: var(--bg); }
+  .add { display: flex; gap: 6px; margin-top: 10px; border-top: 1px solid var(--dim); padding-top: 8px; }
+  section { margin-bottom: 22px; }
+  .row { display: flex; align-items: center; gap: 8px; padding: 1px 4px; }
+  .row:hover { outline: 1px dotted var(--dim); }
+  .row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .n { width: 3ch; color: var(--dim); }
+  .picker { position: relative; border: 1px solid var(--fg); padding: 2px 6px; margin-top: 8px; }
+  #sugg { position: absolute; left: -1px; right: -1px; top: 100%; background: var(--bg); border: 1px solid var(--fg); max-height: 260px; overflow-y: auto; z-index: 5; display: none; }
+  #sugg li { padding: 0 6px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #sugg li.sel, #sugg li:hover { background: var(--fg); color: var(--bg); }
+  h2 { font-size: 26px; font-weight: normal; margin: 0 0 6px; }
+  h2::before { content: "■ "; }
+  .note { color: var(--dim); font-size: 19px; }
+  #toast { position: fixed; bottom: 16px; right: 16px; padding: 4px 10px; display: none; }
+  .empty { color: var(--dim); padding: 2px 4px; }
+  .nativeonly[hidden] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OPEN_UP<span class="blink">_</span></h1>
+  <div class="bar">
+    <span class="dim" id="inv">0 apps indexed</span>
+    <button class="nativeonly" id="rescan" hidden>RESCAN APPS</button>
+    <label class="check"><input type="checkbox" id="learn"><span class="mark"></span> learn from picks</label>
+    <button id="resetAll">FORGET ALL PICKS</button>
+  </div>
+</header>
+
+<main>
+  <div class="box">
+    <span class="label">&nbsp;FILE TYPES&nbsp;</span>
+    <ul id="exts"></ul>
+    <form class="add" id="addExt">
+      <span>.</span><input id="newExt" placeholder="add ext (e.g. md)" spellcheck="false" autocomplete="off">
+      <button>ADD</button>
+    </form>
+  </div>
+
+  <div class="box" id="detail">
+    <span class="label" id="detailLabel">&nbsp;.?&nbsp;</span>
+
+    <section>
+      <h2>YOUR RANKED APPS</h2>
+      <div class="note">The top one is the first guess. Learned picks and macOS suggestions come after these.</div>
+      <ul id="rules"></ul>
+      <div class="picker">
+        <input id="appSearch" placeholder="+ add an app... (type to search)" spellcheck="false" autocomplete="off">
+        <ul id="sugg"></ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>LEARNED FROM YOUR PICKS</h2>
+      <ul id="picks"></ul>
+      <button id="resetExt" style="margin-top:6px">FORGET PICKS FOR THIS TYPE</button>
+    </section>
+
+    <section>
+      <h2>CURRENT GUESS ORDER</h2>
+      <div class="note">Not counting macOS suggestions, which depend on the actual file.</div>
+      <ul id="preview"></ul>
+    </section>
+
+    <section class="nativeonly" hidden id="defSec">
+      <h2>DOUBLE-CLICK HANDLER</h2>
+      <div class="note">Make OPEN_UP the default app for this type, so double-clicking a file shows the picker.</div>
+      <button id="makeDefault" style="margin-top:6px">MAKE OPEN_UP DEFAULT FOR <span id="defExt">.?</span></button>
+    </section>
+    <section id="browserNote">
+      <div class="note">Opened in a browser. Launch OPEN_UP.app without a file to get the native buttons (default handler, rescan).</div>
+    </section>
+  </div>
+</main>
+<div id="toast" class="inv"></div>
+
+<script>
+const native = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.openup;
+const $ = (id) => document.getElementById(id);
+let ST = null, cur = null;
+
+const api = (path, body) => fetch(path, body === undefined ? {} : {
+  method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+}).then(r => r.json());
+
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = "none", 2600);
+}
+window.onNative = (m) => { if (m.message) toast(m.message); if (m.reload) load(); };
+
+const nameOf = (p) => (ST.apps[p] && ST.apps[p].name) || p.split("/").pop().replace(/\.app$/, "");
+const label = (e) => e === "*" ? "* (any type)" : e === "(none)" ? "(no extension)" : "." + e;
+
+async function load() {
+  ST = await api("/api/state");
+  $("inv").textContent = Object.keys(ST.apps).length + " apps indexed";
+  $("learn").checked = ST.settings.learn !== false;
+  const exts = new Set([...Object.keys(ST.rules), ...Object.keys(ST.picks)]);
+  if (cur) exts.add(cur);
+  const list = [...exts].sort((a, b) => (a === "*") - (b === "*") || a.localeCompare(b));
+  if (!cur) cur = list[0] || null;
+  const ul = $("exts"); ul.innerHTML = "";
+  if (!list.length) ul.innerHTML = '<li class="dim">no types yet</li>';
+  for (const e of list) {
+    const li = document.createElement("li");
+    const n = (ST.rules[e] || []).length;
+    li.innerHTML = `<span></span><span class="dim">${n ? n + " app" + (n > 1 ? "s" : "") : "learned"}</span>`;
+    li.firstChild.textContent = label(e);
+    if (e === cur) li.className = "sel";
+    li.onclick = () => { cur = e; load(); };
+    ul.appendChild(li);
+  }
+  renderDetail();
+}
+
+function renderDetail() {
+  $("detail").style.visibility = cur ? "" : "hidden";
+  if (!cur) return;
+  $("detailLabel").innerHTML = "&nbsp;" + label(cur).replace(/</g, "&lt;") + "&nbsp;";
+  $("defExt").textContent = label(cur);
+  $("makeDefault").disabled = cur === "*" || cur === "(none)";
+
+  const rules = ST.rules[cur] || [];
+  const ul = $("rules"); ul.innerHTML = "";
+  if (!rules.length) ul.innerHTML = '<li class="empty">none yet. add one below.</li>';
+  rules.forEach((p, i) => {
+    const li = document.createElement("li"); li.className = "row";
+    li.innerHTML = `<span class="n">${i + 1}.</span><span class="name"></span>
+      <button title="move up" ${i === 0 ? "disabled" : ""}>↑</button>
+      <button title="move down" ${i === rules.length - 1 ? "disabled" : ""}>↓</button>
+      <button title="remove">X</button>`;
+    li.querySelector(".name").textContent = nameOf(p);
+    li.querySelector(".name").title = p;
+    const [up, down, rm] = li.querySelectorAll("button");
+    up.onclick = () => saveRules(swap(rules, i, i - 1));
+    down.onclick = () => saveRules(swap(rules, i, i + 1));
+    rm.onclick = () => saveRules(rules.filter((_, j) => j !== i));
+    ul.appendChild(li);
+  });
+
+  const picks = Object.entries(ST.picks[cur] || {}).sort((a, b) => b[1].count - a[1].count);
+  const pl = $("picks"); pl.innerHTML = "";
+  if (!picks.length) pl.innerHTML = '<li class="empty">nothing picked yet</li>';
+  for (const [p, v] of picks) {
+    const li = document.createElement("li"); li.className = "row";
+    li.innerHTML = `<span class="name"></span><span class="dim"></span>`;
+    li.querySelector(".name").textContent = nameOf(p);
+    li.querySelector(".dim").textContent = `${v.count}x · last ${new Date(v.last * 1000).toLocaleDateString()}`;
+    pl.appendChild(li);
+  }
+
+  api("/api/rank/" + encodeURIComponent(cur)).then(r => {
+    const pv = $("preview"); pv.innerHTML = "";
+    if (!r.ranked.length) pv.innerHTML = '<li class="empty">macOS suggestions only</li>';
+    r.ranked.forEach((a, i) => {
+      const li = document.createElement("li"); li.className = "row";
+      li.innerHTML = `<span class="n">${i + 1}.</span><span class="name"></span><span class="dim"></span>`;
+      li.querySelector(".name").textContent = a.name + (i === 0 ? "  ◄ GUESS" : "");
+      li.querySelector(".dim").textContent = a.reasons.join(" · ");
+      pv.appendChild(li);
+    });
+  });
+}
+
+const swap = (arr, i, j) => { const a = arr.slice(); [a[i], a[j]] = [a[j], a[i]]; return a; };
+async function saveRules(apps) { await api("/api/rules", { ext: cur, apps }); load(); }
+
+// app search / add
+let suggSel = 0, suggItems = [];
+function showSugg() {
+  const q = $("appSearch").value.trim().toLowerCase();
+  const have = new Set(ST.rules[cur] || []);
+  suggItems = Object.entries(ST.apps)
+    .filter(([p, a]) => !have.has(p) && (!q || a.name.toLowerCase().includes(q)))
+    .sort((a, b) => a[1].name.localeCompare(b[1].name)).slice(0, 60);
+  suggSel = Math.min(suggSel, Math.max(0, suggItems.length - 1));
+  const ul = $("sugg"); ul.innerHTML = "";
+  if (!Object.keys(ST.apps).length) ul.innerHTML = '<li class="dim">no apps indexed. open OPEN_UP.app once.</li>';
+  suggItems.forEach(([p, a], i) => {
+    const li = document.createElement("li"); li.textContent = a.name; li.title = p;
+    if (i === suggSel) li.className = "sel";
+    li.onmousedown = (e) => { e.preventDefault(); addApp(p); };
+    ul.appendChild(li);
+  });
+  ul.style.display = "block";
+}
+function addApp(p) {
+  $("appSearch").value = ""; $("sugg").style.display = "none";
+  saveRules([...(ST.rules[cur] || []), p]);
+}
+$("appSearch").addEventListener("focus", showSugg);
+$("appSearch").addEventListener("input", () => { suggSel = 0; showSugg(); });
+$("appSearch").addEventListener("blur", () => $("sugg").style.display = "none");
+$("appSearch").addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown") { suggSel = Math.min(suggSel + 1, suggItems.length - 1); showSugg(); e.preventDefault(); }
+  else if (e.key === "ArrowUp") { suggSel = Math.max(suggSel - 1, 0); showSugg(); e.preventDefault(); }
+  else if (e.key === "Enter" && suggItems[suggSel]) { addApp(suggItems[suggSel][0]); e.preventDefault(); }
+  else if (e.key === "Escape") { $("appSearch").blur(); }
+});
+
+$("addExt").onsubmit = (e) => {
+  e.preventDefault();
+  const v = $("newExt").value.trim().toLowerCase().replace(/^\.+/, "");
+  if (!v) return;
+  cur = v; $("newExt").value = ""; load();
+  setTimeout(() => $("appSearch").focus(), 50);
+};
+$("learn").onchange = () => api("/api/settings", { learn: $("learn").checked }).then(load);
+$("resetAll").onclick = () => { if (confirm("Forget every learned pick?")) api("/api/picks/reset", {}).then(load); };
+$("resetExt").onclick = () => api("/api/picks/reset", { ext: cur }).then(load);
+
+if (native) {
+  document.querySelectorAll(".nativeonly").forEach(el => el.hidden = false);
+  $("browserNote").hidden = true;
+  $("rescan").onclick = () => native.postMessage({ type: "rescan" });
+  $("makeDefault").onclick = () => native.postMessage({ type: "setDefault", ext: cur });
+}
+load();
+</script>
+</body>
+</html>
