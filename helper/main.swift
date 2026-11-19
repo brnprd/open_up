@@ -674,7 +674,7 @@ final class Snapshotter: NSObject, WKNavigationDelegate {
     let out: String
     init(out: String) { self.out = out }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {  // let fonts + fetches settle
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {  // let fonts, fetches and the update check settle
             webView.takeSnapshot(with: nil) { img, err in
                 guard let img, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
                       let png = rep.representation(using: .png, properties: [:]) else {
