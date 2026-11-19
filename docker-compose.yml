@@ -1,9 +1,0 @@
-services:
-  openup:
-    build: ./server
-    container_name: openup
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:7777:7777"   # localhost only
-    volumes:
-      - ./data:/data

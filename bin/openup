@@ -1,7 +1,9 @@
 #!/bin/bash
-# openup <files...>   — show the OPEN_UP picker for these files
-# openup              — open OPEN_UP settings
-# openup --default md pdf   — make OPEN_UP the double-click app for those types
-APP="$HOME/Applications/OPEN_UP.app"
+# openup <files...>          show the OPEN_UP picker for these files
+# openup                     open OPEN_UP settings
+# openup --default md pdf    make OPEN_UP the double-click app for those types
+APP=""
+for a in "$HOME/Applications/OPEN_UP.app" "/Applications/OPEN_UP.app"; do [[ -d "$a" ]] && APP="$a" && break; done
+[[ -z "$APP" ]] && { echo "OPEN_UP.app not found in ~/Applications or /Applications" >&2; exit 1; }
 if [[ "${1:-}" == "--default" ]]; then shift; exec "$APP/Contents/MacOS/OpenUp" --set-default "$@"; fi
 exec open -a "$APP" "$@"

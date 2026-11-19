@@ -1,42 +1,200 @@
-// OPEN_UP Mac helper.
+// OPEN_UP — a Spotlight-style "open with…" picker for macOS.
 //
-// The UI and all the logic live in the Docker container. This helper is a thin
-// native shell: it receives files from macOS (double-click / `open -a`), asks
-// the container to rank apps, shows the container's picker page in a floating
-// borderless window, and launches the app you choose.
+// One self-contained app. It receives files from macOS (double-click / `open -a`),
+// ranks apps for the file type (your rules → past picks → macOS suggestions), shows
+// the bundled picker page in a floating borderless window, and launches what you pick.
+//
+// The UI is HTML in Contents/Resources/ui, served through a private `openup://`
+// URL scheme. Pages reach the app's data through a message bridge, not the network:
+// nothing listens on a port.
 //
 // Run with no files → settings window.
-// CLI: OpenUp --set-default md pdf ...  → make OPEN_UP the default for those types.
+// CLI: OpenUp --set-default md pdf ...   make OPEN_UP the default for those types
+//      OpenUp --snapshot pick|settings out.png   render a page to PNG (for development)
 
 import Cocoa
 import UniformTypeIdentifiers
 import WebKit
 
-let serverBase = UserDefaults.standard.string(forKey: "serverURL") ?? "http://127.0.0.1:7777"
-
 func displayName(_ url: URL) -> String {
     FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
 }
 
-// MARK: - networking
-
-func request(_ path: String, _ body: Any? = nil, done: @escaping ([String: Any]?, Error?) -> Void) {
-    var req = URLRequest(url: URL(string: serverBase + path)!)
-    req.timeoutInterval = 3
-    if let body {
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-    }
-    URLSession.shared.dataTask(with: req) { data, _, err in
-        let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-        DispatchQueue.main.async { done(json, err) }
-    }.resume()
+func normExt(_ s: String?) -> String {
+    var e = (s ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+    while e.hasPrefix(".") { e.removeFirst() }
+    return e.isEmpty ? "(none)" : e
 }
 
-// MARK: - app inventory
+func extOf(_ path: String) -> String {
+    let name = (path as NSString).lastPathComponent
+    let ext = (name as NSString).pathExtension
+    return name.hasPrefix(".") && !name.dropFirst().contains(".") ? "(none)" : normExt(ext)
+}
 
-func scanApps() -> [[String: String]] {
+func jsonString(_ obj: Any) -> String {
+    guard let d = try? JSONSerialization.data(withJSONObject: obj), let s = String(data: d, encoding: .utf8) else { return "{}" }
+    return s
+}
+
+// MARK: - state (rules, learned picks, app index)
+
+struct AppInfo: Codable { var name: String; var bundleId: String? }
+struct Pick: Codable { var count: Int; var last: Double }
+
+struct State: Codable {
+    var apps: [String: AppInfo] = [:]       // app path -> info
+    var rules: [String: [String]] = [:]     // ext -> ranked app paths ("*" = any type)
+    var picks: [String: [String: Pick]] = [:] // ext -> app path -> pick stats
+    var learn = true
+
+    enum CodingKeys: String, CodingKey { case apps, rules, picks, settings }
+    struct Settings: Codable { var learn: Bool? }
+
+    init() {}
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        apps = (try? c.decodeIfPresent([String: AppInfo].self, forKey: .apps)) ?? [:]
+        rules = (try? c.decodeIfPresent([String: [String]].self, forKey: .rules)) ?? [:]
+        picks = (try? c.decodeIfPresent([String: [String: Pick]].self, forKey: .picks)) ?? [:]
+        learn = (try? c.decodeIfPresent(Settings.self, forKey: .settings))?.learn ?? true
+    }
+    func encode(to e: Encoder) throws {
+        var c = e.container(keyedBy: CodingKeys.self)
+        try c.encode(apps, forKey: .apps)
+        try c.encode(rules, forKey: .rules)
+        try c.encode(picks, forKey: .picks)
+        try c.encode(Settings(learn: learn), forKey: .settings)
+    }
+}
+
+struct Session { let files: [String]; let ext: String; let candidates: [[String: String]] }
+
+final class Store {
+    static let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("OPEN_UP", isDirectory: true)
+    static let file = dir.appendingPathComponent("state.json")
+
+    var state = State()
+    var sessions: [String: Session] = [:]
+
+    init() {
+        if let data = try? Data(contentsOf: Self.file), let s = try? JSONDecoder().decode(State.self, from: data) {
+            state = s
+        }
+    }
+
+    func save() {
+        try? FileManager.default.createDirectory(at: Self.dir, withIntermediateDirectories: true)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? enc.encode(state) { try? data.write(to: Self.file, options: .atomic) }
+    }
+
+    func name(_ path: String, _ fallback: String? = nil) -> String {
+        if let n = state.apps[path]?.name, !n.isEmpty { return n }
+        return fallback ?? ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+    }
+
+    /// Score apps for an extension. Same formula as before:
+    /// rule #i = 1000 - 10i (any-type rules 400 - 10i), each past pick 5 (+3 if in the last week),
+    /// macOS suggestion 1–2 (macOS lists better handlers first).
+    func rank(_ ext: String, _ candidates: [[String: String]]) -> (ranked: [[String: Any]], others: [[String: Any]]) {
+        var score: [String: Double] = [:]
+        var reasons: [String: [String]] = [:]
+        var names: [String: String] = [:]
+        for c in candidates { if let p = c["path"] { names[p] = c["name"] } }
+        func bump(_ p: String, _ pts: Double, _ why: String) { score[p, default: 0] += pts; reasons[p, default: []].append(why) }
+
+        for (scope, label, base) in [(ext, "rule", 1000.0), ("*", "any-type rule", 400.0)] {
+            for (i, p) in (state.rules[scope] ?? []).enumerated() { bump(p, base - Double(i) * 10, "\(label) #\(i + 1)") }
+        }
+        if state.learn {
+            let now = Date().timeIntervalSince1970
+            for (p, pk) in state.picks[ext] ?? [:] {
+                var pts = Double(pk.count) * 5
+                if now - pk.last < 7 * 86400 { pts += 3 }
+                if pts > 0 { bump(p, pts, "used \(pk.count)x") }
+            }
+        }
+        let n = Double(max(candidates.count, 1))
+        for (i, c) in candidates.enumerated() { if let p = c["path"] { bump(p, 1 + (n - Double(i)) / n, "macOS") } }
+
+        let ranked = score.keys.sorted {
+            score[$0]! != score[$1]! ? score[$0]! > score[$1]! : name($0, names[$0]).lowercased() < name($1, names[$1]).lowercased()
+        }.map { p -> [String: Any] in
+            ["path": p, "name": name(p, names[p]), "score": (score[p]! * 100).rounded() / 100, "reasons": reasons[p]!]
+        }
+        let others = state.apps.filter { score[$0.key] == nil }
+            .map { ["path": $0.key, "name": $0.value.name] as [String: Any] }
+            .sorted { ($0["name"] as! String).lowercased() < ($1["name"] as! String).lowercased() }
+        return (ranked, others)
+    }
+
+    func newSession(files: [String], candidates: [[String: String]]) -> String {
+        if sessions.count > 50 { sessions.removeAll() }
+        let id = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).lowercased()
+        sessions[id] = Session(files: files, ext: extOf(files[0]), candidates: candidates)
+        return id
+    }
+
+    func recordPick(ext: String, app: String, always: Bool) {
+        var pk = state.picks[ext]?[app] ?? Pick(count: 0, last: 0)
+        if state.learn { pk.count += 1 }
+        pk.last = Date().timeIntervalSince1970
+        state.picks[ext, default: [:]][app] = pk
+        if always { state.rules[ext] = [app] + (state.rules[ext] ?? []).filter { $0 != app } }
+        save()
+    }
+
+    /// The pages' `/api/...` calls land here. Returns (status, JSON object).
+    func api(method: String, path: String, body: [String: Any]) -> (Int, Any) {
+        let parts = path.split(separator: "/").map { String($0).removingPercentEncoding ?? String($0) }
+        // parts: ["api", route, arg?]
+        guard parts.first == "api", parts.count >= 2 else { return (404, ["error": "not found"]) }
+        let route = parts[1], arg = parts.count > 2 ? parts[2] : nil
+
+        switch (method, route) {
+        case ("GET", "state"):
+            let data = (try? JSONEncoder().encode(state)) ?? Data("{}".utf8)
+            return (200, (try? JSONSerialization.jsonObject(with: data)) ?? [:])
+        case ("GET", "session"):
+            guard let id = arg, let s = sessions[id] else { return (404, ["error": "session expired"]) }
+            let r = rank(s.ext, s.candidates)
+            return (200, ["id": id, "ext": s.ext, "files": s.files, "ranked": r.ranked, "others": r.others])
+        case ("GET", "rank"):
+            let ext = normExt(arg)
+            return (200, ["ext": ext, "ranked": rank(ext, []).ranked])
+        case ("POST", "pick"):
+            guard let app = body["app"] as? String, app.hasSuffix(".app") else { return (400, ["error": "bad app"]) }
+            recordPick(ext: normExt(body["ext"] as? String), app: app, always: body["always"] as? Bool ?? false)
+            return (200, ["ok": true])
+        case ("POST", "rules"):
+            let raw = body["ext"] as? String
+            let ext = raw == "*" ? "*" : normExt(raw)
+            let apps = (body["apps"] as? [Any] ?? []).compactMap { $0 as? String }.filter { $0.hasSuffix(".app") }
+            if apps.isEmpty { state.rules.removeValue(forKey: ext) } else { state.rules[ext] = apps }
+            save()
+            return (200, ["ok": true])
+        case ("POST", "picks"):  // /api/picks/reset
+            if let e = body["ext"] as? String, !e.isEmpty { state.picks.removeValue(forKey: normExt(e)) } else { state.picks = [:] }
+            save()
+            return (200, ["ok": true])
+        case ("POST", "settings"):
+            if let l = body["learn"] as? Bool { state.learn = l }
+            save()
+            return (200, ["ok": true])
+        default:
+            return (404, ["error": "not found"])
+        }
+    }
+}
+
+let store = Store()
+
+// MARK: - app index and macOS suggestions
+
+func scanApps() -> [String: AppInfo] {
     let fm = FileManager.default
     let roots = [
         "/Applications", "/Applications/Utilities",
@@ -44,8 +202,7 @@ func scanApps() -> [[String: String]] {
         "/System/Library/CoreServices/Applications",
         NSHomeDirectory() + "/Applications",
     ]
-    var seen = Set<String>()
-    var out: [[String: String]] = []
+    var out: [String: AppInfo] = [:]
     let myID = Bundle.main.bundleIdentifier
 
     func visit(_ dir: String, depth: Int) {
@@ -54,16 +211,13 @@ func scanApps() -> [[String: String]] {
             let path = (dir as NSString).appendingPathComponent(item)
             if item.hasSuffix(".app") {
                 let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
-                guard !seen.contains(url.path) else { continue }
-                seen.insert(url.path)
-                let bid = Bundle(url: url)?.bundleIdentifier ?? ""
+                guard out[url.path] == nil else { continue }
+                let bid = Bundle(url: url)?.bundleIdentifier
                 if bid == myID { continue }
-                out.append(["path": url.path, "name": displayName(url), "bundleId": bid])
+                out[url.path] = AppInfo(name: displayName(url), bundleId: bid)
             } else if depth > 0 {
                 var isDir: ObjCBool = false
-                if fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue {
-                    visit(path, depth: depth - 1)
-                }
+                if fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue { visit(path, depth: depth - 1) }
             }
         }
     }
@@ -94,6 +248,45 @@ func setDefault(ext: String, done: @escaping (String) -> Void) {
     }
 }
 
+// MARK: - bundled UI
+
+/// Serves Contents/Resources/ui over openup://app/...
+final class UIScheme: NSObject, WKURLSchemeHandler {
+    static let pages = ["/": "settings.html", "/settings": "settings.html", "/pick": "pick.html", "/theme.css": "theme.css"]
+
+    func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
+        guard let url = task.request.url, let name = Self.pages[url.path.isEmpty ? "/" : url.path],
+              let file = Bundle.main.resourceURL?.appendingPathComponent("ui/\(name)"),
+              let data = try? Data(contentsOf: file) else {
+            task.didFailWithError(URLError(.fileDoesNotExist))
+            return
+        }
+        let mime = name.hasSuffix(".css") ? "text/css" : "text/html"
+        task.didReceive(URLResponse(url: url, mimeType: mime, expectedContentLength: data.count, textEncodingName: "utf-8"))
+        task.didReceive(data)
+        task.didFinish()
+    }
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+}
+
+/// Routes the pages' fetch("/api/...") calls to the app instead of the network.
+let fetchShim = """
+(() => {
+  const real = window.fetch.bind(window);
+  window.fetch = async (input, opts = {}) => {
+    const url = typeof input === "string" ? input : input.url;
+    const path = url.replace(/^openup:\\/\\/app/, "");
+    if (!path.startsWith("/api/")) return real(input, opts);
+    const out = await window.webkit.messageHandlers.api.postMessage({
+      path: path.split("?")[0], method: (opts.method || "GET").toUpperCase(), body: opts.body ? JSON.parse(opts.body) : {}
+    });
+    return new Response(out.body, { status: out.status, headers: { "Content-Type": "application/json" } });
+  };
+})();
+"""
+
+let uiBase = "openup://app"
+
 // MARK: - windows
 
 final class KeyWindow: NSWindow {
@@ -101,7 +294,8 @@ final class KeyWindow: NSWindow {
     override var canBecomeMain: Bool { true }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply,
+    WKNavigationDelegate, NSWindowDelegate {
     var queue: [[URL]] = []
     var gotFiles = false
     var picker: KeyWindow?
@@ -109,10 +303,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     var currentFiles: [URL] = []
     var settings: NSWindow?
     var ignoreResignUntil = Date.distantPast
+    let scheme = UIScheme()
+    var snapshotMode = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        if snapshotMode { return }
         buildMenu()
-        pushInventory(nil)
+        rescan(nil)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
             if !self.gotFiles { self.showSettings() }
         }
@@ -140,6 +337,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if picker?.isVisible != true && settings == nil && queue.isEmpty { NSApp.terminate(nil) }
     }
 
+    func rescan(_ done: ((Int) -> Void)?) {
+        DispatchQueue.global(qos: .utility).async {
+            let apps = scanApps()
+            DispatchQueue.main.async {
+                store.state.apps = apps
+                store.save()
+                done?(apps.count)
+            }
+        }
+    }
+
+    func makeWeb(frame: NSRect) -> WKWebView {
+        let cfg = WKWebViewConfiguration()
+        cfg.setURLSchemeHandler(scheme, forURLScheme: "openup")
+        cfg.userContentController.add(self, name: "openup")
+        cfg.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "api")
+        cfg.userContentController.addUserScript(WKUserScript(source: fetchShim, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        let web = WKWebView(frame: frame, configuration: cfg)
+        web.navigationDelegate = self
+        web.autoresizingMask = [.width, .height]
+        web.setValue(false, forKey: "drawsBackground")
+        return web
+    }
+
     // MARK: picker
 
     func next() {
@@ -150,24 +371,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
         let files = queue.removeFirst()
         currentFiles = files
-        let body: [String: Any] = ["files": files.map(\.path), "candidates": candidates(for: files[0])]
-        request("/api/session", body) { json, err in
-            if let id = json?["id"] as? String {
-                self.showPicker(session: id)
-            } else {
-                self.fallback(files: files)
-            }
-        }
-    }
-
-    func makeWeb(frame: NSRect) -> WKWebView {
-        let cfg = WKWebViewConfiguration()
-        cfg.userContentController.add(self, name: "openup")
-        let web = WKWebView(frame: frame, configuration: cfg)
-        web.navigationDelegate = self
-        web.autoresizingMask = [.width, .height]
-        web.setValue(false, forKey: "drawsBackground")
-        return web
+        let id = store.newSession(files: files.map(\.path), candidates: candidates(for: files[0]))
+        showPicker(session: id)
     }
 
     func showPicker(session: String) {
@@ -187,7 +392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             pickerWeb = web
         }
         guard let w = picker, let web = pickerWeb else { return }
-        web.load(URLRequest(url: URL(string: "\(serverBase)/pick?s=\(session)")!))
+        web.load(URLRequest(url: URL(string: "\(uiBase)/pick?s=\(session)")!))
         positionPicker(height: w.frame.height)
         // An app we just launched may grab focus a moment after this picker appears;
         // don't count that as a click-away.
@@ -197,29 +402,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         w.makeFirstResponder(web)
     }
 
-    /// Spotlight-ish: horizontally centered, top edge about a quarter down the screen.
+    /// Spotlight-ish: horizontally centered, top edge about a fifth of the way down the screen.
     func positionPicker(height: CGFloat) {
         guard let w = picker, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let v = screen.visibleFrame
         let h = min(max(height, 120), v.height * 0.8)
         let top = v.maxY - v.height * 0.22
         w.setFrame(NSRect(x: v.midX - w.frame.width / 2, y: top - h, width: w.frame.width, height: h), display: true)
-    }
-
-    /// Container unreachable: plain native alert with macOS's suggestions.
-    func fallback(files: [URL]) {
-        let cands = Array(candidates(for: files[0]).prefix(3))
-        let alert = NSAlert()
-        alert.messageText = "OPEN_UP server isn't running"
-        alert.informativeText = "Start it with `docker compose up -d` in the open_up folder.\n\nOpen \(files[0].lastPathComponent) with:"
-        for c in cands { alert.addButton(withTitle: c["name"] ?? "?") }
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        let r = alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
-        if r >= 0 && r < cands.count, let p = cands[r]["path"] {
-            launch(app: URL(fileURLWithPath: p), files: files)
-        }
-        next()
     }
 
     func launch(app: URL, files: [URL]) {
@@ -252,7 +441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         w.delegate = self
         let web = makeWeb(frame: w.contentView!.bounds)
         w.contentView!.addSubview(web)
-        web.load(URLRequest(url: URL(string: serverBase + "/")!))
+        web.load(URLRequest(url: URL(string: uiBase + "/")!))
         w.center()
         settings = w
         NSApp.activate(ignoringOtherApps: true)
@@ -274,39 +463,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
     }
 
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation nav: WKNavigation!, withError error: Error) {
-        let html = """
-        <body style="background:#000;color:#eee;font:20px Menlo,monospace;padding:30px">
-        <p>&gt; OPEN_UP SERVER NOT REACHABLE AT \(serverBase)</p>
-        <p>&gt; run: <b>docker compose up -d</b> in the open_up folder, then reopen.</p>
-        <p>&gt; press esc to close<span style="animation:b 1s steps(1) infinite">_</span></p>
-        <style>@keyframes b{50%{opacity:0}}</style>
-        <script>document.onkeydown=e=>{if(e.key==='Escape')webkit.messageHandlers.openup.postMessage({type:'cancel'})}</script>
-        </body>
-        """
-        webView.loadHTMLString(html, baseURL: nil)
-        if webView === pickerWeb { positionPicker(height: 200) }
-    }
-
     // MARK: bridge
 
-    func pushInventory(_ done: ((Int) -> Void)?) {
-        DispatchQueue.global(qos: .utility).async {
-            let apps = scanApps()
-            DispatchQueue.main.async {
-                request("/api/apps", ["apps": apps]) { json, _ in done?(json?["count"] as? Int ?? -1) }
-            }
-        }
-    }
-
     func reply(_ web: WKWebView?, _ obj: [String: Any]) {
-        guard let web, let data = try? JSONSerialization.data(withJSONObject: obj),
-              let s = String(data: data, encoding: .utf8) else { return }
-        web.evaluateJavaScript("window.onNative && window.onNative(\(s))")
+        web?.evaluateJavaScript("window.onNative && window.onNative(\(jsonString(obj)))")
     }
 
+    /// Only our own bundled pages may talk to the app.
+    func trusted(_ message: WKScriptMessage) -> Bool {
+        message.frameInfo.isMainFrame && message.frameInfo.securityOrigin.protocol == "openup"
+    }
+
+    /// fetch("/api/...") from the pages.
+    func userContentController(_ ucc: WKUserContentController, didReceive message: WKScriptMessage,
+                               replyHandler: @escaping (Any?, String?) -> Void) {
+        guard trusted(message), let msg = message.body as? [String: Any], let path = msg["path"] as? String else {
+            replyHandler(["status": 403, "body": jsonString(["error": "forbidden"])], nil)
+            return
+        }
+        let (status, obj) = store.api(method: msg["method"] as? String ?? "GET", path: path, body: msg["body"] as? [String: Any] ?? [:])
+        replyHandler(["status": status, "body": jsonString(obj)], nil)
+    }
+
+    /// Native actions from the pages.
     func userContentController(_ ucc: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let msg = message.body as? [String: Any], let type = msg["type"] as? String else { return }
+        guard trusted(message), let msg = message.body as? [String: Any], let type = msg["type"] as? String else { return }
         let web = message.webView
         let fromPicker = web === pickerWeb
 
@@ -334,7 +515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         case "setDefault":
             if let ext = msg["ext"] as? String { setDefault(ext: ext) { self.reply(web, ["message": $0]) } }
         case "rescan":
-            pushInventory { n in self.reply(web, ["message": "Indexed \(n) apps", "reload": true]) }
+            rescan { n in self.reply(web, ["message": "Indexed \(n) apps", "reload": true]) }
         default:
             break
         }
@@ -360,11 +541,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 }
 
+// MARK: - development: render a page offscreen to a PNG
+
+final class Snapshotter: NSObject, WKNavigationDelegate {
+    let out: String
+    init(out: String) { self.out = out }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {  // let fonts + fetches settle
+            webView.takeSnapshot(with: nil) { img, err in
+                guard let img, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+                      let png = rep.representation(using: .png, properties: [:]) else {
+                    print("snapshot failed: \(err?.localizedDescription ?? "?")"); exit(1)
+                }
+                try? png.write(to: URL(fileURLWithPath: self.out))
+                print("wrote \(self.out)")
+                exit(0)
+            }
+        }
+    }
+}
+
 // MARK: - entry
 
 let args = CommandLine.arguments
 if let i = args.firstIndex(of: "--set-default") {
-    let exts = args[(i + 1)...].map { $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
+    let exts = args[(i + 1)...].map { normExt($0) }
     if exts.isEmpty { print("usage: OpenUp --set-default md pdf txt ..."); exit(1) }
     let group = DispatchGroup()
     for e in exts {
@@ -378,5 +579,30 @@ if let i = args.firstIndex(of: "--set-default") {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
+
+if let i = args.firstIndex(of: "--snapshot"), args.count > i + 2 {
+    let page = args[i + 1], out = args[i + 2]
+    let size = page == "pick" ? NSSize(width: 660, height: 300) : NSSize(width: 1000, height: 720)
+    let w = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
+    let web = delegate.makeWeb(frame: NSRect(origin: .zero, size: size))
+    delegate.snapshotMode = true
+    let snap = Snapshotter(out: out)
+    web.navigationDelegate = snap
+    w.contentView!.addSubview(web)
+    w.setFrameOrigin(NSPoint(x: -10000, y: -10000))
+    w.orderBack(nil)
+    var url = uiBase + "/"
+    if page == "pick" {
+        store.state.apps = scanApps()
+        let f = args.count > i + 3 ? args[i + 3] : NSHomeDirectory() + "/example.md"
+        let id = store.newSession(files: [f], candidates: candidates(for: URL(fileURLWithPath: f)))
+        url = "\(uiBase)/pick?s=\(id)"
+    }
+    web.load(URLRequest(url: URL(string: url)!))
+    app.setActivationPolicy(.accessory)
+    withExtendedLifetime(snap) { app.run() }
+    exit(0)
+}
+
 app.setActivationPolicy(.accessory)
 app.run()

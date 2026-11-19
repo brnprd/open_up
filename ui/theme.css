@@ -44,7 +44,7 @@ body::after {
   padding: 0 6px;
 }
 
-.inv { background: var(--fg); color: var(--bg); }
+.inv, .box > .label.inv { background: var(--fg); color: var(--bg); }
 .dim { color: var(--dim); }
 
 input[type="text"], input:not([type]) {
