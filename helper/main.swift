@@ -37,6 +37,66 @@ func jsonString(_ obj: Any) -> String {
     return s
 }
 
+// MARK: - update check (public GitHub Releases)
+
+let releasesAPI = URL(string: "https://api.github.com/repos/brnprd/open_up/releases/latest")!
+let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+
+/// "1.10" > "1.9"; missing parts count as 0.
+func isNewer(_ a: String, than b: String) -> Bool {
+    let pa = a.split(separator: ".").map { Int($0) ?? 0 }, pb = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(pa.count, pb.count) {
+        let x = i < pa.count ? pa[i] : 0, y = i < pb.count ? pb[i] : 0
+        if x != y { return x > y }
+    }
+    return false
+}
+
+/// Asks GitHub for the latest release. Sends nothing about you: a plain anonymous GET.
+final class Updater {
+    var latest: String?
+    var downloadURL: URL?
+    var error: String?
+
+    var available: Bool { latest.map { isNewer($0, than: currentVersion) } ?? false }
+    var info: [String: Any] {
+        ["current": currentVersion, "latest": latest ?? NSNull(), "available": available, "error": error ?? NSNull()]
+    }
+
+    func check(done: @escaping () -> Void) {
+        var req = URLRequest(url: releasesAPI)
+        req.timeoutInterval = 10
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("OPEN_UP-updater", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            DispatchQueue.main.async {
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                guard err == nil, code == 200, let data,
+                      let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let tag = j["tag_name"] as? String else {
+                    self.error = code == 404 ? "no releases yet" : "couldn't reach GitHub"
+                    done()
+                    return
+                }
+                self.error = nil
+                self.latest = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+                let assets = j["assets"] as? [[String: Any]] ?? []
+                let dmg = assets.compactMap { $0["browser_download_url"] as? String }.first { $0.hasSuffix(".dmg") }
+                self.downloadURL = (dmg ?? j["html_url"] as? String).flatMap(URL.init(string:))
+                done()
+            }
+        }.resume()
+    }
+
+    /// Opens the DMG download (or the release page) in the browser. GitHub links only.
+    func openDownload() {
+        guard let url = downloadURL, url.scheme == "https", url.host?.hasSuffix("github.com") == true else { return }
+        NSWorkspace.shared.open(url)
+    }
+}
+
+let updater = Updater()
+
 // MARK: - state (rules, learned picks, app index)
 
 struct AppInfo: Codable { var name: String; var bundleId: String? }
@@ -569,6 +629,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             }
         case "setDefault":
             if let ext = msg["ext"] as? String { setDefault(ext: ext) { self.reply(web, ["message": $0]) } }
+        case "checkUpdate":
+            let manual = msg["manual"] as? Bool ?? false
+            updater.check {
+                var out: [String: Any] = ["update": updater.info]
+                if manual {
+                    out["message"] = updater.available ? "v\(updater.latest!) is available"
+                        : updater.error ?? "You're on the latest version (v\(currentVersion))"
+                }
+                self.reply(web, out)
+            }
+        case "getUpdate":
+            updater.openDownload()
         case "rescan":
             rescan { n in self.reply(web, ["message": "Indexed \(n) apps", "reload": true]) }
         default:

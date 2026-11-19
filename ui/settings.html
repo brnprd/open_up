@@ -39,6 +39,8 @@
 <header>
   <h1>OPEN_UP<span class="blink">_</span></h1>
   <div class="bar">
+    <span class="dim" id="ver"></span>
+    <button class="nativeonly" id="upd" hidden>CHECK FOR UPDATES</button>
     <span class="dim" id="inv">0 apps indexed</span>
     <button class="nativeonly" id="rescan" hidden>RESCAN APPS</button>
     <label class="check"><input type="checkbox" id="learn"><span class="mark"></span> learn from picks</label>
@@ -106,7 +108,20 @@ function toast(msg) {
   const t = $("toast"); t.textContent = msg; t.style.display = "block";
   clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = "none", 2600);
 }
-window.onNative = (m) => { if (m.message) toast(m.message); if (m.reload) load(); };
+window.onNative = (m) => {
+  if (m.update) showUpdate(m.update);
+  if (m.message) toast(m.message);
+  if (m.reload) load();
+};
+
+let updateInfo = null;
+function showUpdate(u) {
+  updateInfo = u;
+  $("ver").textContent = "v" + u.current;
+  const b = $("upd");
+  if (u.available) { b.textContent = "UPDATE TO v" + u.latest + " ↓"; b.classList.add("inv"); }
+  else { b.textContent = "CHECK FOR UPDATES"; b.classList.remove("inv"); }
+}
 
 const nameOf = (p) => (ST.apps[p] && ST.apps[p].name) || p.split("/").pop().replace(/\.app$/, "");
 const label = (e) => e === "*" ? "* (any type)" : e === "(none)" ? "(no extension)" : "." + e;
@@ -233,6 +248,9 @@ if (native) {
   document.querySelectorAll(".nativeonly").forEach(el => el.hidden = false);
   $("browserNote").hidden = true;
   $("rescan").onclick = () => native.postMessage({ type: "rescan" });
+  $("upd").onclick = () => native.postMessage(updateInfo && updateInfo.available
+    ? { type: "getUpdate" } : { type: "checkUpdate", manual: true });
+  native.postMessage({ type: "checkUpdate" });  // quiet check each time settings opens
   $("makeDefault").onclick = () => native.postMessage({ type: "setDefault", ext: cur });
 }
 load();

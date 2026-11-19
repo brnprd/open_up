@@ -43,7 +43,7 @@ Undo a default: Finder → Get Info → Open with → choose an app → Change A
 | Try it | `./install.sh` rebuilds and reinstalls to `~/Applications` (it quits the running copy first). Then double-click a file or `open ~/Applications/OPEN_UP.app`. |
 | Check the look | `~/Applications/OPEN_UP.app/Contents/MacOS/OpenUp --snapshot pick out.png [file]` (or `settings`) renders a page to a PNG. |
 | Save | `git add -A && git commit -m "..."` then `git push`. Pushing only stores the code on GitHub; it doesn't update anyone's app. |
-| Release | Bump `CFBundleShortVersionString` in `helper/Info.plist`, run `./package.sh`, and share `dist/OPEN_UP-<version>.dmg`. People install the new DMG over the old app. |
+| Release | Bump `CFBundleShortVersionString` in `helper/Info.plist`, run `./package.sh`, then `gh release create v<version> dist/OPEN_UP-<version>.dmg`. Installed copies see it next time settings opens ("UPDATE TO v…"). |
 
 For bigger changes, work on a branch (`git switch -c new-thing`), try it with `./install.sh`, then merge into `main`.
 Your rules in Application Support aren't touched by rebuilds.
