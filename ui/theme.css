@@ -35,7 +35,7 @@ body::after {
 ::selection { background: var(--fg); color: var(--bg); }
 
 .box {
-  border: 3px double var(--line);
+  border: 3px solid var(--line);
   position: relative;
 }
 .box > .label {
