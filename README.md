@@ -37,5 +37,15 @@ Undo a default: Finder → Get Info → Open with → choose an app → Change A
 
 ## Development
 
-- Edit `ui/*.html` / `ui/theme.css` or `helper/main.swift`, then `./install.sh`.
-- `OpenUp --snapshot pick|settings out.png [file]` renders a page offscreen to a PNG for checking the look.
+| Step | What to do |
+|---|---|
+| Edit | Change `ui/*.html`, `ui/theme.css` or `helper/main.swift`. |
+| Try it | `./install.sh` rebuilds and reinstalls to `~/Applications` (it quits the running copy first). Then double-click a file or `open ~/Applications/OPEN_UP.app`. |
+| Check the look | `~/Applications/OPEN_UP.app/Contents/MacOS/OpenUp --snapshot pick out.png [file]` (or `settings`) renders a page to a PNG. |
+| Save | `git add -A && git commit -m "..."` then `git push`. Pushing only stores the code on GitHub; it doesn't update anyone's app. |
+| Release | Bump `CFBundleShortVersionString` in `helper/Info.plist`, run `./package.sh`, and share `dist/OPEN_UP-<version>.dmg`. People install the new DMG over the old app. |
+
+For bigger changes, work on a branch (`git switch -c new-thing`), try it with `./install.sh`, then merge into `main`.
+Your rules in Application Support aren't touched by rebuilds.
+
+Fonts: [Commit Mono](https://commitmono.com) by Eigil Nikolajsen, MIT license (`ui/fonts/CommitMono-LICENSE.txt`).

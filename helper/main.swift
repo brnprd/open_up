@@ -252,17 +252,25 @@ func setDefault(ext: String, done: @escaping (String) -> Void) {
 
 /// Serves Contents/Resources/ui over openup://app/...
 final class UIScheme: NSObject, WKURLSchemeHandler {
-    static let pages = ["/": "settings.html", "/settings": "settings.html", "/pick": "pick.html", "/theme.css": "theme.css"]
+    static let pages = ["/": "settings.html", "/settings": "settings.html", "/pick": "pick.html"]
+    static let mimes = ["html": "text/html", "css": "text/css", "otf": "font/otf", "woff2": "font/woff2"]
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
-        guard let url = task.request.url, let name = Self.pages[url.path.isEmpty ? "/" : url.path],
-              let file = Bundle.main.resourceURL?.appendingPathComponent("ui/\(name)"),
+        guard let url = task.request.url,
+              let ui = Bundle.main.resourceURL?.appendingPathComponent("ui", isDirectory: true).standardizedFileURL else {
+            task.didFailWithError(URLError(.badURL)); return
+        }
+        let path = url.path.isEmpty ? "/" : url.path
+        let name = Self.pages[path] ?? String(path.dropFirst())
+        let file = ui.appendingPathComponent(name).standardizedFileURL
+        // Only files inside Contents/Resources/ui, of the types above.
+        guard file.path.hasPrefix(ui.path + "/"), let mime = Self.mimes[file.pathExtension.lowercased()],
               let data = try? Data(contentsOf: file) else {
             task.didFailWithError(URLError(.fileDoesNotExist))
             return
         }
-        let mime = name.hasSuffix(".css") ? "text/css" : "text/html"
-        task.didReceive(URLResponse(url: url, mimeType: mime, expectedContentLength: data.count, textEncodingName: "utf-8"))
+        task.didReceive(URLResponse(url: url, mimeType: mime, expectedContentLength: data.count,
+                                    textEncodingName: mime.hasPrefix("text/") ? "utf-8" : nil))
         task.didReceive(data)
         task.didFinish()
     }

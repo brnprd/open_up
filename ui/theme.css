@@ -1,12 +1,14 @@
 /* OPEN_UP — monochrome terminal theme. Black and white only. */
-@import url("https://fonts.googleapis.com/css2?family=VT323&display=swap");
+/* Commit Mono (MIT, Eigil Nikolajsen) is bundled in ui/fonts: works offline. */
+@font-face { font-family: "Commit Mono"; src: url("/fonts/CommitMono-400.otf") format("opentype"); font-weight: 400; }
+@font-face { font-family: "Commit Mono"; src: url("/fonts/CommitMono-700.otf") format("opentype"); font-weight: 700; }
 
 :root {
   --bg: #000;
   --fg: #f2f2f2;
   --dim: #8a8a8a;
   --line: #f2f2f2;
-  --font: "VT323", "Menlo", "Monaco", monospace;
+  --font: "Commit Mono", "SF Mono", "Menlo", monospace;
 }
 
 * { box-sizing: border-box; }
@@ -16,9 +18,9 @@ html, body {
   background: var(--bg);
   color: var(--fg);
   font-family: var(--font);
-  font-size: 22px;
-  line-height: 1.15;
-  -webkit-font-smoothing: none;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
 }
 
 /* faint CRT scanlines */
