@@ -302,11 +302,18 @@ final class KeyWindow: NSWindow {
     override var canBecomeMain: Bool { true }
 }
 
+/// The picker: a Spotlight-style panel. `.nonactivatingPanel` lets it take keyboard focus
+/// without OPEN_UP having to become the frontmost app (newer macOS often refuses that).
+final class PickerPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply,
     WKNavigationDelegate, NSWindowDelegate {
     var queue: [[URL]] = []
     var gotFiles = false
-    var picker: KeyWindow?
+    var picker: PickerPanel?
+    var clickMonitors: [Any] = []
     var pickerWeb: WKWebView?
     var currentFiles: [URL] = []
     var settings: NSWindow?
@@ -373,7 +380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
     func next() {
         guard !queue.isEmpty else {
-            picker?.orderOut(nil)
+            hidePicker()
             maybeQuit()
             return
         }
@@ -385,8 +392,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
     func showPicker(session: String) {
         if picker == nil {
-            let w = KeyWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 240),
-                              styleMask: [.borderless], backing: .buffered, defer: false)
+            let w = PickerPanel(contentRect: NSRect(x: 0, y: 0, width: 660, height: 240),
+                                styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            w.becomesKeyOnlyIfNeeded = false
+            w.hidesOnDeactivate = false
             w.level = .floating
             w.backgroundColor = .black
             w.hasShadow = true
@@ -405,9 +414,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         // An app we just launched may grab focus a moment after this picker appears;
         // don't count that as a click-away.
         ignoreResignUntil = Date().addingTimeInterval(1.0)
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         w.makeKeyAndOrderFront(nil)
         w.makeFirstResponder(web)
+        watchClicksOutside()
+    }
+
+    func activateApp() {
+        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    /// Any mouse click outside the picker dismisses it, whether or not the picker had focus:
+    /// a global monitor sees clicks in other apps and on the desktop, a local one sees clicks
+    /// in OPEN_UP's other windows (settings).
+    func watchClicksOutside() {
+        guard clickMonitors.isEmpty else { return }
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in self?.dismissPicker() }) {
+            clickMonitors.append(g)
+        }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] e in
+            if let self, e.window !== self.picker { self.dismissPicker() }
+            return e
+        }) {
+            clickMonitors.append(l)
+        }
+    }
+
+    func hidePicker() {
+        picker?.orderOut(nil)
+        clickMonitors.forEach(NSEvent.removeMonitor)
+        clickMonitors = []
+    }
+
+    /// Click-away / esc: skip this file; any queued files get their own picker.
+    func dismissPicker() {
+        guard picker?.isVisible == true else { return }
+        hidePicker()
+        next()
     }
 
     /// Spotlight-ish: horizontally centered, top edge about a fifth of the way down the screen.
@@ -435,7 +479,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
     func showSettings() {
         if let s = settings {
-            NSApp.activate(ignoringOtherApps: true)
+            activateApp()
             s.makeKeyAndOrderFront(nil)
             return
         }
@@ -452,16 +496,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         web.load(URLRequest(url: URL(string: uiBase + "/")!))
         w.center()
         settings = w
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         w.makeKeyAndOrderFront(nil)
     }
 
     /// Clicking outside the picker (another window, the desktop, another app) dismisses it,
     /// like Spotlight. Counts as cancel for this file; any queued files get their own picker.
     func windowDidResignKey(_ note: Notification) {
-        guard let w = note.object as? NSWindow, w === picker, w.isVisible, Date() > ignoreResignUntil else { return }
-        w.orderOut(nil)
-        next()
+        guard let w = note.object as? NSWindow, w === picker, Date() > ignoreResignUntil else { return }
+        dismissPicker()
     }
 
     func windowWillClose(_ note: Notification) {
@@ -508,18 +551,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             }
             // Only open the files macOS handed us; never paths supplied by the page.
             let files = currentFiles
-            picker?.orderOut(nil)
+            hidePicker()
             launch(app: URL(fileURLWithPath: path), files: files)
             next()
         case "cancel":
             if fromPicker {
-                picker?.orderOut(nil)
-                next()
+                dismissPicker()
             } else {
                 settings?.close()
             }
         case "resize":
-            if fromPicker, let h = msg["height"] as? Double { positionPicker(height: CGFloat(h)) }
+            guard let h = msg["height"] as? Double else { return }
+            if fromPicker {
+                positionPicker(height: CGFloat(h))
+            } else if snapshotMode, let w = web?.window {
+                w.setContentSize(NSSize(width: w.frame.width, height: CGFloat(h)))  // snapshot what the real window would show
+            }
         case "setDefault":
             if let ext = msg["ext"] as? String { setDefault(ext: ext) { self.reply(web, ["message": $0]) } }
         case "rescan":
