@@ -376,6 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     var clickMonitors: [Any] = []
     var pickerWeb: WKWebView?
     var currentFiles: [URL] = []
+    var pendingLaunches = 0
     var settings: NSWindow?
     var ignoreResignUntil = Date.distantPast
     let scheme = UIScheme()
@@ -409,7 +410,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     func maybeQuit() {
-        if picker?.isVisible != true && settings == nil && queue.isEmpty { NSApp.terminate(nil) }
+        // Wait for pending opens: quitting mid-handoff silently drops the file (Preview never opens).
+        if picker?.isVisible != true && settings == nil && queue.isEmpty && pendingLaunches == 0 { NSApp.terminate(nil) }
     }
 
     func rescan(_ done: ((Int) -> Void)?) {
@@ -524,13 +526,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     func launch(app: URL, files: [URL]) {
+        pendingLaunches += 1
         NSWorkspace.shared.open(files, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()) { _, err in
-            if let err {
-                DispatchQueue.main.async {
+            DispatchQueue.main.async {
+                if let err {
                     let a = NSAlert(error: err)
                     a.messageText = "Couldn't open with \(displayName(app))"
                     a.runModal()
                 }
+                self.pendingLaunches -= 1
+                self.maybeQuit()
             }
         }
     }
